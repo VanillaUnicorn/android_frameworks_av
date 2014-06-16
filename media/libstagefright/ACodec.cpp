@@ -384,7 +384,8 @@ ACodec::ACodec()
       mDequeueCounter(0),
       mStoreMetaDataInOutputBuffers(false),
       mMetaDataBuffersToSubmit(0),
-      mRepeatFrameDelayUs(-1ll) {
+      mRepeatFrameDelayUs(-1ll),
+      mMaxPtsGapUs(-1l) {
     mUninitializedState = new UninitializedState(this);
     mLoadedState = new LoadedState(this);
     mLoadedToIdleState = new LoadedToIdleState(this);
@@ -1159,6 +1160,10 @@ status_t ACodec::configureCodec(
                     "repeat-previous-frame-after",
                     &mRepeatFrameDelayUs)) {
             mRepeatFrameDelayUs = -1ll;
+        }
+
+        if (!msg->findInt64("max-pts-gap-to-encoder", &mMaxPtsGapUs)) {
+            mMaxPtsGapUs = -1l;
         }
     }
 
@@ -3373,11 +3378,11 @@ void ACodec::BaseState::onInputBufferFilled(const sp<AMessage> &msg) {
                 mCodec->mInputEOSResult = err;
             }
             break;
-
-            default:
-                CHECK_EQ((int)mode, (int)FREE_BUFFERS);
-                break;
         }
+
+        default:
+            CHECK_EQ((int)mode, (int)FREE_BUFFERS);
+            break;
     }
 }
 
@@ -3723,7 +3728,7 @@ bool ACodec::UninitializedState::onAllocateComponent(const sp<AMessage> &msg) {
     Vector<OMXCodec::CodecNameAndQuirks> matchingCodecs;
 
     AString mime;
-
+    int32_t encoder = false;
     AString componentName;
     uint32_t quirks = 0;
     if (msg->findString("componentName", &componentName)) {
@@ -3738,7 +3743,6 @@ bool ACodec::UninitializedState::onAllocateComponent(const sp<AMessage> &msg) {
     } else {
         CHECK(msg->findString("mime", &mime));
 
-        int32_t encoder;
         if (!msg->findInt32("encoder", &encoder)) {
             encoder = false;
         }
@@ -3768,6 +3772,46 @@ bool ACodec::UninitializedState::onAllocateComponent(const sp<AMessage> &msg) {
         status_t err = omx->allocateNode(componentName.c_str(), observer, &node);
         androidSetThreadPriority(tid, prevPriority);
 
+        if(err == OK && node != NULL) {
+            // set component name
+            mCodec->mComponentName = componentName;
+            mCodec->mFlags = 0;
+
+            if (componentName.endsWith(".secure")) {
+                mCodec->mFlags |= kFlagIsSecure;
+                mCodec->mFlags |= kFlagPushBlankBuffersToNativeWindowOnShutdown;
+            }
+
+            mCodec->mQuirks = quirks;
+            mCodec->mOMX = omx;
+            mCodec->mNode = node;
+        }
+
+        if ((err == OK) && !encoder && !strncasecmp(mime.c_str(), "video/", 6)) {
+            int32_t width=0, height=0;
+            if (msg->findInt32("width", &width)
+                    && msg->findInt32("height", &height)) {
+                //set and check if resolution is supported
+                OMX_VIDEO_CODINGTYPE compressionFormat;
+                err = GetVideoCodingTypeFromMime(mime.c_str(), &compressionFormat);
+
+#ifdef QCOM_HARDWARE
+                if (err != OK) {
+                    err = ExtendedCodec::setVideoOutputFormat(mime.c_str(),
+                                                              &compressionFormat);
+                }
+#endif
+                if (err == OK) {
+                    err = mCodec->setVideoFormatOnPort(kPortIndexInput, width,
+                                                       height, compressionFormat);
+                }
+
+                if(err != OK) {
+                    ALOGE("setVideoFormatOnPort Failed");
+                }
+            }
+        }
+
         if (err == OK) {
             break;
         }
@@ -3789,18 +3833,6 @@ bool ACodec::UninitializedState::onAllocateComponent(const sp<AMessage> &msg) {
 
     notify = new AMessage(kWhatOMXMessage, mCodec->id());
     observer->setNotificationMessage(notify);
-
-    mCodec->mComponentName = componentName;
-    mCodec->mFlags = 0;
-
-    if (componentName.endsWith(".secure")) {
-        mCodec->mFlags |= kFlagIsSecure;
-        mCodec->mFlags |= kFlagPushBlankBuffersToNativeWindowOnShutdown;
-    }
-
-    mCodec->mQuirks = quirks;
-    mCodec->mOMX = omx;
-    mCodec->mNode = node;
 
     {
         sp<AMessage> notify = mCodec->mNotify->dup();
@@ -3914,6 +3946,7 @@ bool ACodec::LoadedState::onConfigureComponent(
 
     CHECK(mCodec->mNode != NULL);
 
+#ifndef QCOM_HARDWARE
     AString mime;
     CHECK(msg->findString("mime", &mime));
 
@@ -3926,6 +3959,13 @@ bool ACodec::LoadedState::onConfigureComponent(
         mCodec->signalError(OMX_ErrorUndefined, err);
         return false;
     }
+
+    {
+        sp<AMessage> notify = mCodec->mNotify->dup();
+        notify->setInt32("what", ACodec::kWhatComponentConfigured);
+        notify->post();
+    }
+#endif
 
     sp<RefBase> obj;
     if (msg->findObject("native-window", &obj)
@@ -3941,11 +3981,26 @@ bool ACodec::LoadedState::onConfigureComponent(
     }
     CHECK_EQ((status_t)OK, mCodec->initNativeWindow());
 
+#ifdef QCOM_HARDWARE
+    AString mime;
+    CHECK(msg->findString("mime", &mime));
+
+    status_t err = mCodec->configureCodec(mime.c_str(), msg);
+
+    if (err != OK) {
+        ALOGE("[%s] configureCodec returning error %d",
+              mCodec->mComponentName.c_str(), err);
+
+        mCodec->signalError(OMX_ErrorUndefined, err);
+        return false;
+    }
+
     {
         sp<AMessage> notify = mCodec->mNotify->dup();
         notify->setInt32("what", ACodec::kWhatComponentConfigured);
         notify->post();
     }
+#endif
 
     return true;
 }
@@ -3974,6 +4029,21 @@ void ACodec::LoadedState::onCreateInputSurface(
         if (err != OK) {
             ALOGE("[%s] Unable to configure option to repeat previous "
                   "frames (err %d)",
+                  mCodec->mComponentName.c_str(),
+                  err);
+        }
+    }
+
+    if (err == OK && mCodec->mMaxPtsGapUs > 0l) {
+        err = mCodec->mOMX->setInternalOption(
+                mCodec->mNode,
+                kPortIndexInput,
+                IOMX::INTERNAL_OPTION_MAX_TIMESTAMP_GAP,
+                &mCodec->mMaxPtsGapUs,
+                sizeof(mCodec->mMaxPtsGapUs));
+
+        if (err != OK) {
+            ALOGE("[%s] Unable to configure max timestamp gap (err %d)",
                   mCodec->mComponentName.c_str(),
                   err);
         }

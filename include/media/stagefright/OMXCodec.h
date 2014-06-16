@@ -1,4 +1,7 @@
 /*
+ * Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+ * Not a Contribution.
+ *
  * Copyright (C) 2009 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -103,8 +106,8 @@ struct OMXCodec : public MediaSource,
 #if defined(OMAP_ENHANCEMENT)
         kAvoidMemcopyInputRecordingFrames     = 0x20000000,
 #endif
-#ifdef QCOM_HARDWARE
         kRequiresGlobalFlush                  = 0x20000000, // 2^29
+#ifdef QCOM_HARDWARE
         kRequiresWMAProComponent              = 0x40000000, //2^30
 #endif
     };
@@ -146,18 +149,14 @@ private:
         EXECUTING_TO_IDLE,
         IDLE_TO_LOADED,
         RECONFIGURING,
-#ifdef QCOM_HARDWARE
         PAUSING,
         FLUSHING,
         PAUSED,
-#endif
         ERROR
     };
 
     enum {
-#ifdef QCOM_HARDWARE
         kPortIndexBoth   = -1,
-#endif
         kPortIndexInput  = 0,
         kPortIndexOutput = 1
     };
@@ -305,6 +304,22 @@ private:
     void setRawAudioFormat(
             OMX_U32 portIndex, int32_t sampleRate, int32_t numChannels);
 
+    //video
+    status_t setWMVFormat(const sp<MetaData> &inputFormat);
+    status_t setRVFormat(const sp<MetaData> &inputFormat);
+    status_t setFFmpegVideoFormat(const sp<MetaData> &inputFormat);
+    //audio
+    status_t setMP3Format(const sp<MetaData> &inputFormat);
+    status_t setWMAFormat(const sp<MetaData> &inputFormat);
+    status_t setVORBISFormat(const sp<MetaData> &inputFormat);
+    status_t setRAFormat(const sp<MetaData> &inputFormat);
+    status_t setFLACFormat(const sp<MetaData> &inputFormat);
+    status_t setMP2Format(const sp<MetaData> &inputFormat);
+    status_t setAC3Format(const sp<MetaData> &inputFormat);
+    status_t setAPEFormat(const sp<MetaData> &inputFormat);
+    status_t setDTSFormat(const sp<MetaData> &inputFormat);
+    status_t setFFmpegAudioFormat(const sp<MetaData> &inputFormat);
+
     status_t allocateBuffers();
     status_t allocateBuffersOnPort(OMX_U32 portIndex);
 #ifdef USE_SAMSUNG_COLORFORMAT
@@ -370,9 +385,7 @@ private:
     status_t applyRotation();
     status_t waitForBufferFilled_l();
 
-#ifdef QCOM_HARDWARE
     status_t resumeLocked(bool drainInputBuf);
-#endif
 
     int64_t getDecodingTimeUs();
 
@@ -381,15 +394,22 @@ private:
             unsigned *profile, unsigned *level);
 
     status_t stopOmxComponent_l();
+    status_t flushBuffersOnError();
+    status_t releaseMediaBuffersOn(OMX_U32 portIndex);
 
     OMXCodec(const OMXCodec &);
     OMXCodec &operator=(const OMXCodec &);
+    bool hasDisabledPorts();
 
 #ifdef QCOM_HARDWARE
     int32_t mNumBFrames;
 #endif
     bool mInSmoothStreamingMode;
     bool mOutputCropChanged;
+    bool mSignalledReadTryAgain;
+    bool mReturnedRetry;
+    int64_t mLastSeekTimeUs;
+    ReadOptions::SeekMode mLastSeekMode;
 };
 
 struct CodecCapabilities {

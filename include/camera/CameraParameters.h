@@ -77,6 +77,11 @@ public:
     void getPreviewSize(int *width, int *height) const;
     void getSupportedPreviewSizes(Vector<Size> &sizes) const;
 
+#ifdef HTC_CAMERA_HARDWARE
+    void getBrightnessLumaTargetSet(int *magic, int *sauce) const;
+    void getRawSize(int *magic, int *sauce) const;
+#endif
+
     // Set the dimensions in pixels to the given width and height
     // for video frames. The given width and height must be one
     // of the supported dimensions returned from
@@ -573,8 +578,10 @@ public:
     static const char KEY_FULL_VIDEO_SNAP_SUPPORTED[];
 
 #ifdef QCOM_HARDWARE
+#ifndef HAVE_ISO
     static const char KEY_ISO_MODE[];
     static const char KEY_SUPPORTED_ISO_MODES[];
+#endif
     static const char KEY_LENSSHADE[] ;
     static const char KEY_SUPPORTED_LENSSHADE_MODES[] ;
 
@@ -717,6 +724,26 @@ public:
 
     // Value for KEY_FOCUS_DISTANCES.
     static const char FOCUS_DISTANCE_INFINITY[];
+
+#ifdef SONY_CAM_PARAMS
+    static const char KEY_SONY_ISO[];
+    static const char KEY_SONY_METERING_MODE[];
+    static const char KEY_SONY_VS[];
+    static const char KEY_SONY_MAX_BURST_SHOT_SIZE[];
+    static const char KEY_SONY_BURST_SHOT_VALUES[];
+    static const char KEY_SONY_VS_VALUES[];
+    static const char KEY_SONY_METERING_MODE_VALUES[];
+    static const char KEY_SONY_AE_MODE[];
+    static const char KEY_SONY_AE_MODE_VALUES[];
+    static const char KEY_SONY_ISO_VALUES[];
+    static const char KEY_SONY_IS[];
+    static const char KEY_SONY_IS_VALUES[];
+    static const char KEY_SONY_EXTENSION_VERSION[];
+    static const char KEY_SONY_FOCUS_AREA[];
+    static const char KEY_SONY_FOCUS_AREA_VALUES[];
+    static const char KEY_SONY_MAX_MULTI_FOCUS_NUM[];
+    static const char KEY_SONY_SCENE_DETECT_SUPPORTED[];
+#endif
 
 #ifdef QCOM_HARDWARE
     // DENOISE

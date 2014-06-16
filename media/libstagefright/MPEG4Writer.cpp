@@ -39,14 +39,14 @@
 #include <unistd.h>
 
 #include "include/ESDS.h"
-
 #include "include/ExtendedUtils.h"
 
 namespace android {
 
 static const int64_t kMinStreamableFileSizeInBytes = 5 * 1024 * 1024;
-static const int64_t kMax32BitFileSize = 0x007fffffffLL;
-static const int64_t kMax64BitFileSize = 0x00ffffffffLL; //fat32 max size limited to 4GB
+static const int64_t kMax32BitFileSize = 0x00ffffffffLL; // 2^32-1 : max FAT32
+                                                         // filesystem file size
+                                                         // used by most SD cards
 static const uint8_t kNalUnitTypeSeqParamSet = 0x07;
 static const uint8_t kNalUnitTypePicParamSet = 0x08;
 static const int64_t kInitialDelayTimeUs     = 700000LL;
@@ -293,6 +293,7 @@ private:
     // Simple validation on the codec specific data
     status_t checkCodecSpecificData() const;
     int32_t mRotation;
+    int32_t mHFRRatio;
 
     void updateTrackSizeEstimate();
     void addOneStscTableEntry(size_t chunkId, size_t sampleId);
@@ -577,7 +578,7 @@ status_t MPEG4Writer::start(MetaData *param) {
         use64BitOffset) {
         mUse32BitOffset = false;
         if (mMaxFileSizeLimitBytes == 0) {
-            mMaxFileSizeLimitBytes = kMax64BitFileSize;
+            mMaxFileSizeLimitBytes = kMax32BitFileSize;
         }
     }
 
@@ -867,11 +868,11 @@ status_t MPEG4Writer::reset() {
     // Fix up the size of the 'mdat' chunk.
     if (mUse32BitOffset) {
         lseek64(mFd, mMdatOffset, SEEK_SET);
-        int32_t size = htonl(static_cast<int32_t>(mOffset - mMdatOffset));
+        uint32_t size = htonl(static_cast<uint32_t>(mOffset - mMdatOffset));
         ::write(mFd, &size, 4);
     } else {
         lseek64(mFd, mMdatOffset + 8, SEEK_SET);
-        int64_t size = mOffset - mMdatOffset;
+        uint64_t size = mOffset - mMdatOffset;
         size = hton64(size);
         ::write(mFd, &size, 8);
     }
@@ -1361,7 +1362,8 @@ MPEG4Writer::Track::Track(
       mCodecSpecificDataSize(0),
       mGotAllCodecSpecificData(false),
       mReachedEOS(false),
-      mRotation(0) {
+      mRotation(0),
+      mHFRRatio(1) {
     getCodecSpecificDataFromInputFormatIfPossible();
 
     const char *mime;
@@ -1757,6 +1759,11 @@ status_t MPEG4Writer::Track::start(MetaData *params) {
 
     pthread_create(&mThread, &attr, ThreadWrapper, this);
     pthread_attr_destroy(&attr);
+
+    mHFRRatio = ExtendedUtils::HFR::getHFRRatio(mMeta);
+    // Workaround until HFR is fully functional
+    if (!mHFRRatio)
+	mHFRRatio = 1;
 
     return OK;
 }
@@ -2266,10 +2273,6 @@ status_t MPEG4Writer::Track::threadEntry() {
         meta_data->findInt32(kKeyIsSyncFrame, &isSync);
         CHECK(meta_data->findInt64(kKeyTime, &timestampUs));
 
-        if (!mIsAudio) {
-            ExtendedUtils::HFR::reCalculateTimeStamp(mMeta, timestampUs);
-        }
-
 ////////////////////////////////////////////////////////////////////////////////
         if (mStszTableEntries->count() == 0) {
             mFirstSampleTimeRealUs = systemTime() / 1000;
@@ -2279,11 +2282,6 @@ status_t MPEG4Writer::Track::threadEntry() {
         }
 
         if (mResumed) {
-            int64_t durExcludingEarlierPausesUs = timestampUs - previousPausedDurationUs;
-            CHECK_GE(durExcludingEarlierPausesUs, 0ll);
-            int64_t pausedDurationUs = durExcludingEarlierPausesUs - mTrackDurationUs;
-            CHECK_GE(pausedDurationUs, lastDurationUs);
-            previousPausedDurationUs += pausedDurationUs - lastDurationUs;
             mResumed = false;
         }
 
@@ -2297,17 +2295,13 @@ status_t MPEG4Writer::Track::threadEntry() {
              * Decoding time: decodingTimeUs
              * Composition time offset = composition time - decoding time
              */
-            int64_t tmpCttsOffsetTimeUs;
             int64_t decodingTimeUs;
             CHECK(meta_data->findInt64(kKeyDecodingTime, &decodingTimeUs));
-            ExtendedUtils::HFR::reCalculateTimeStamp(mMeta, decodingTimeUs);
 
             decodingTimeUs -= previousPausedDurationUs;
             cttsOffsetTimeUs =
                     timestampUs - decodingTimeUs;
-            tmpCttsOffsetTimeUs = kMaxCttsOffsetTimeUs;
-            ExtendedUtils::HFR::reCalculateTimeStamp(mMeta, tmpCttsOffsetTimeUs);
-            CHECK_GE(tmpCttsOffsetTimeUs, decodingTimeUs - timestampUs);
+            CHECK_GE(kMaxCttsOffsetTimeUs, decodingTimeUs - timestampUs);
             timestampUs = decodingTimeUs;
             ALOGV("decoding time: %lld and ctts offset time: %lld",
                 timestampUs, cttsOffsetTimeUs);
@@ -2371,7 +2365,9 @@ status_t MPEG4Writer::Track::threadEntry() {
         if (currDurationTicks < 0ll) {
             ALOGE("timestampUs %lld < lastTimestampUs %lld for %s track",
                 timestampUs, lastTimestampUs, mIsAudio? "Audio": "Video");
-            return UNKNOWN_ERROR;
+            err = UNKNOWN_ERROR;
+            mSource->notifyError(err);
+            return err;
         }
 
         mStszTableEntries->add(htonl(sampleSize));
@@ -2652,7 +2648,7 @@ void MPEG4Writer::Track::bufferChunk(int64_t timestampUs) {
 }
 
 int64_t MPEG4Writer::Track::getDurationUs() const {
-    return mTrackDurationUs;
+    return mTrackDurationUs * mHFRRatio;
 }
 
 int64_t MPEG4Writer::Track::getEstimatedTrackSizeBytes() const {
@@ -2974,8 +2970,10 @@ void MPEG4Writer::Track::writeMdhdBox(uint32_t now) {
     mOwner->writeInt32(0);             // version=0, flags=0
     mOwner->writeInt32(now);           // creation time
     mOwner->writeInt32(now);           // modification time
-    mOwner->writeInt32(mTimeScale);    // media timescale
-    int32_t mdhdDuration = (trakDurationUs * mTimeScale + 5E5) / 1E6;
+
+    int32_t timeScale = mTimeScale / mHFRRatio;
+    mOwner->writeInt32(timeScale);    // media timescale
+    int32_t mdhdDuration = (trakDurationUs * timeScale + 5E5) / 1E6;
     mOwner->writeInt32(mdhdDuration);  // use media timescale
     // Language follows the three letter standard ISO-639-2/T
     // 'e', 'n', 'g' for "English", for instance.
